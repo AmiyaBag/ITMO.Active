@@ -1,33 +1,21 @@
 import os
 import requests
 import asyncio
-import signal
-import sys
-import threading
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 import uvicorn
 
-# --- Обработчик сигнала для graceful shutdown (упрощённый) ---
-def signal_handler(sig, frame):
-    print("\nShutting down gracefully...")
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-
-# --- Переменные окружения ---
+# --- Переменные окружения (должны быть заданы в Render) ---
 STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
 STRAVA_CLIENT_SECRET = os.getenv("STRAVA_CLIENT_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# --- Инициализация бота и диспетчера (aiogram v3) ---
+# --- Инициализация бота и диспетчера ---
 bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()                # <-- ИСПРАВЛЕНО
-app = FastAPI()
-
-# Хранилище токенов (в памяти, не подходит для продакшена)
-users = {}
+dp = Dispatcher()
+users = {}  # временное хранилище (заменить на БД в будущем)
 
 # --- Команда /login ---
 @dp.message(Command('login'))
@@ -36,15 +24,15 @@ async def login(message: types.Message):
         "https://www.strava.com/oauth/authorize"
         f"?client_id={STRAVA_CLIENT_ID}"
         "&response_type=code"
-        "&redirect_uri=https://itmo-active.onrender.com"   # ЗАМЕНИТЬ на Render URL при деплое
+        "&redirect_uri=https://itmo-active.onrender.com/callback"  # ВАЖНО: ваш URL
         "&approval_prompt=force"
         "&scope=activity:read"
         f"&state={message.from_user.id}"
     )
     await message.answer(f"Авторизуйся:\n{auth_url}")
 
-# --- Команда /steps (aiogram v3) ---
-@dp.message(Command('steps'))    # <-- ИСПРАВЛЕНО
+# --- Команда /steps ---
+@dp.message(Command('steps'))
 async def steps(message: types.Message):
     user_id = str(message.from_user.id)
     if user_id not in users:
@@ -54,7 +42,7 @@ async def steps(message: types.Message):
     steps_count = get_today_steps(token)
     await message.answer(f"Сегодня примерно {steps_count} шагов")
 
-# --- OAuth callback ---
+# --- OAuth callback (FastAPI) ---
 @app.get("/callback")
 async def callback(request: Request):
     code = request.query_params.get("code")
@@ -91,7 +79,7 @@ async def callback(request: Request):
     users[user_id] = access_token
     return {"status": "Авторизация успешна"}
 
-# --- Получение шагов из Strava (синхронно, лучше заменить на async) ---
+# --- Функция для получения шагов из Strava (синхронная, лучше заменить на async/httpx) ---
 def get_today_steps(token):
     headers = {"Authorization": f"Bearer {token}"}
     activities = requests.get(
@@ -103,16 +91,26 @@ def get_today_steps(token):
     for act in activities:
         if act["type"] in ["Run", "Walk"]:
             distance = act["distance"]
-            steps += int(distance / 0.75)
+            steps += int(distance / 0.75)  # грубая оценка
     return steps
 
-# --- Запуск бота в отдельном потоке ---
-def start_bot():
-    asyncio.run(dp.start_polling(bot))   # <-- ИСПРАВЛЕНО (dp, а не bot напрямую)
+# --- Lifespan: запускаем и останавливаем polling бота ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Запуск бота в фоне
+    polling_task = asyncio.create_task(dp.start_polling(bot))
+    print("Bot polling started")
+    yield
+    # Остановка при завершении приложения
+    polling_task.cancel()
+    try:
+        await polling_task
+    except asyncio.CancelledError:
+        print("Bot polling stopped")
 
-bot_thread = threading.Thread(target=start_bot, daemon=True)
-bot_thread.start()
+# --- Создаём приложение FastAPI с lifespan ---
+app = FastAPI(lifespan=lifespan)
 
-# --- Запуск FastAPI ---
+# --- Запуск (только для локальной отладки, на Render используется команда из Procfile) ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
