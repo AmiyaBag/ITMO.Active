@@ -22,6 +22,8 @@ users = {}  # временное хранилище
 # --- Lifespan: запуск polling ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Сброс вебхука и очистка ожидающих обновлений
+    await bot.delete_webhook(drop_pending_updates=True)
     polling_task = asyncio.create_task(dp.start_polling(bot))
     print("Bot polling started")
     yield
